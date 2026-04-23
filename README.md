@@ -1,6 +1,8 @@
-# Flow xử lý `interactor.go` — Version 2 (annotated)
+# Flow xử lý `app/repayment/usecase/interactor.go`
 
-Mỗi mermaid chart đi kèm **giải thích từng node** ngay bên dưới (technical + business logic).
+Tài liệu tóm tắt flow theo section spec `Nudge-バッチ仕様書_金利計算バッチ`, có annotate **table nguồn** cho từng bước.
+
+> 📥 = READ (query), 📤 = WRITE (insert/update/delete).
 
 ---
 
@@ -8,318 +10,577 @@ Mỗi mermaid chart đi kèm **giải thích từng node** ngay bên dưới (te
 
 ```mermaid
 flowchart TD
-    Start([main.go → Handler.Run]) --> Connect[① Connect DB + ReadReplica]
-    Connect --> Init[② Khởi tạo repositories + usecase]
-    Init --> Retry{③ Retry loop<br/>max 3 lần}
-    Retry --> CalcInterest[④ interactor.CalcInterest]
-    CalcInterest --> CheckRetry{⑤ retry == true?}
-    CheckRetry -- Yes --> Sleep[⑥ sleep 500ms] --> Retry
-    CheckRetry -- No --> End([⑦ return retValue])
+    Start([main.go → Handler.Run]) --> Connect[Connect DB + ReadReplica<br/>handler.go]
+    Connect --> Init[Khởi tạo repositories<br/>+ NewCalcInterest + NewInteractor]
+    Init --> Retry{Retry loop<br/>max 3 lần}
+    Retry --> CalcInterest[interactor.CalcInterest<br/>line 55]
+    CalcInterest --> CheckRetry{retry == true?}
+    CheckRetry -- Yes --> Sleep[sleep 500ms] --> Retry
+    CheckRetry -- No --> End([return retValue])
 ```
-
-### Giải thích từng bước
-
-| # | Step | Technical | Business logic |
-|---|---|---|---|
-| ① | **Connect DB** | Mở 2 connection pool: write (primary) + read replica | Tách read/write để giảm tải master DB. Interest calc đọc rất nhiều (status, history, balance) → đẩy sang replica. |
-| ② | **Init dependencies** | DI pattern: Repository → Usecase → Interactor | Clean architecture — dễ mock/test từng layer. |
-| ③ | **Retry loop x3** | for cnt=0; cnt<3; cnt++ | Batch chạy đêm — nếu DB glitch tạm thời (connection reset) cần tự hồi phục mà không cần Ops can thiệp. |
-| ④ | **CalcInterest** | Entry point business logic | Tách khỏi handler để dễ unit test. |
-| ⑤ | **Check retry flag** | Interactor trả `retry=true` khi có recoverable error | Phân biệt: lỗi transient (retry được) vs fatal (return ngay). |
-| ⑥ | **Sleep 500ms** | Backoff trước retry | Tránh busy-loop khi DB đang recover. |
-| ⑦ | **Return retValue** | 0 = success, 1 = fail | ECS task definition đọc exit code để kích alert. |
 
 ---
 
-## 2. `CalcInterest` — Batch entry
+## 2. `CalcInterest` — Batch entry (line 55)
 
 ```mermaid
 flowchart TD
-    A([CalcInterest start]) --> B[① Tính month = today.Month-2<br/>today = now]
-    B --> C[② Load usersList<br/>hard-code hoặc S3]
-    C --> D{③ len usersList == 0?}
-    D -- Yes --> E[④ Log: none user<br/>retry = false]
-    D -- No --> F[⑤ CalcLoop users, month, today, batchID]
-    F --> G{⑥ notImplementedUsersList empty?}
-    G -- Yes --> H[⑦ WriteFile empty → S3]
-    G -- No --> I[⑧ WriteNotImplList → S3]
-    E --> Z([⑨ return])
+    A([CalcInterest start]) --> B[Tính month = time.Now.Month-2<br/>today = time.Now]
+    B --> C[usersList hard-code<br/>hoặc ImportUsersListFile từ S3<br/>📥 S3: UserList file]
+    C --> D{len usersList == 0?}
+    D -- Yes --> E[Log: Calc user none<br/>retry = false]
+    D -- No --> F[CalcLoop ctx, usersList, month, today, batchID]
+    F --> G{len notImplementedUsersList == 0?}
+    G -- Yes --> H[WriteFile empty UserList.FileName<br/>📤 S3]
+    G -- No --> I[WriteNotImplementedUsersList<br/>+ Upload S3<br/>📤 S3]
+    E --> Z([return retry, err])
     H --> Z
     I --> Z
 ```
 
-### Giải thích từng bước
-
-| # | Step | Technical | Business logic |
-|---|---|---|---|
-| ① | **month = today - 2 tháng** | `time.Now().Month()-2`, format YYYYMM | Nghiệp vụ **請求確定期間 2 tháng**: lãi chỉ tính trên giao dịch đã confirmed. TX tháng 4 chưa confirmed → chỉ tính TX ≤ tháng 2. |
-| ② | **Load usersList** | Hard-code test hoặc download CSV từ S3 | Input của batch: danh sách user cần tính lãi hôm đó. S3 để không phụ thuộc API service. |
-| ③ | **Check empty** | `len(usersList) == 0` | Edge case: file S3 rỗng (vd tất cả user đã xử lý hôm qua) → skip batch, không fail. |
-| ④ | **Log none** | Debug log | Monitoring biết batch chạy nhưng không có user. |
-| ⑤ | **CalcLoop** | Main processing per user | Core business logic. |
-| ⑥ | **Check notImpl empty** | Users fail trong batch được append vào `notImplementedUsersList` | Output của batch — Ops cần biết ai fail để retry. |
-| ⑦ | **Write empty file** | Ghi empty file lên S3 | Clear list cũ — báo "batch chạy xong không có user fail". |
-| ⑧ | **Write notImpl list** | Upload CSV users fail | Batch ngày mai sẽ ưu tiên retry những user này. |
-| ⑨ | **Return** | retry flag + error | Cho handler quyết định retry hay exit. |
-
 ---
 
-## 3. `CalcLoop` — Main processing
+## 3. `CalcLoop` — Main processing (line 303)
 
 ```mermaid
 flowchart TD
-    Start([CalcLoop start]) --> CR[① <b>#820</b> Fetch common_min_repayment_rules<br/>📥 common_min_repayment_rules]
-    CR --> CRE{② err?}
-    CRE -- Yes --> Return1[③ return err]
-    CRE -- No --> CRC[④ Cache commonBaseBillingAmount]
-    CRC --> Loop{⑤ for each user in userList}
-    Loop -- Done --> EndOK([⑥ return])
-    Loop -- Next --> U[⑦ userID + creditLimit]
-    U --> BTX[⑧ Begin Tx]
-    BTX --> S34[⑨ 3.4 GetRepaymentBalance FOR UPDATE<br/>📥 repayment_balances]
-    S34 --> S35[⑩ 3.5 Sum monthly_repayment_balances<br/>📥 monthly_repayment_balances]
-    S35 --> S352[⑪ 3.5-2 GetDirectDebit<br/>📥 direct_debit_payment_terms]
-    S352 --> S36_37[⑫ 3.6/3.7 Status judge]
-    S36_37 --> S38[⑬ 3.8 Billing calc<br/><b>#820 áp dụng ở đây</b>]
-    S38 --> S39[⑭ 3.9 Low-amount cancel]
-    S39 --> S312[⑮ 3.12 Interest calc]
-    S312 --> S313[⑯ 3.13 Update balance]
-    S313 --> Commit[⑰ Commit]
+    Start([CalcLoop start]) --> CommonRule[<b>NEW #820</b> line 304-318<br/>GetCommonMinRepaymentRule<br/>📥 common_min_repayment_rules<br/>WHERE start_month <= currentMonth<br/>ORDER BY start_month DESC LIMIT 1]
+    CommonRule --> CR_Err{err?}
+    CR_Err -- Yes --> Return1[return true, list, err]
+    CR_Err -- No --> CR_Cache[cache commonBaseBillingAmount = MinRepaymentAmount<br/>hasCommonBaseBilling flag]
+    CR_Cache --> Loop{for cnt = 0<br/>cnt less than len userList}
+    Loop -- Done --> EndOK([return retry, notImplList, retErr])
+    Loop -- Next user --> User[userID = userList cnt .UserID<br/>creditLimit = strconv.ParseInt<br/>📥 userList from param / S3]
+    User --> BeginTx[3.4.1 Begin Transaction]
+    BeginTx --> Step34[3.4 GetRepaymentBalance<br/>📥 repayment_balances<br/>WHERE user_id = ? FOR UPDATE]
+    Step34 --> Step35[3.5 GetSumCalcInterestRepayment<br/>📥 monthly_repayment_balances<br/>SUM repayment_balance, SUM repayed_balance<br/>WHERE user_id=? AND date_of_use<=month AND repayed_flg=0]
+    Step35 --> Step352[3.5-2 GetDirectDebitPaymentTerm<br/>📥 direct_debit_payment_terms<br/>WHERE apply_start_date<=batchDate<br/>AND apply_end_date>batchDate AND status=2<br/>→ accountTranferFlg]
+    Step352 --> Step36[3.6 Status init]
+    Step36 --> Step37[3.7 Status judgment]
+    Step37 --> Step38[3.8 Billing calc]
+    Step38 --> Step39[3.9 Low-usage cancel]
+    Step39 --> Step312[3.12 Interest calc]
+    Step312 --> Step313[3.13 Update balance]
+    Step313 --> Commit[Commit Transaction]
     Commit --> Loop
 ```
 
-### Giải thích từng bước
-
-| # | Step | Technical | Business logic |
-|---|---|---|---|
-| ① | **Fetch common rule 1 lần** | Query `common_min_repayment_rules ORDER BY start_month DESC LIMIT 1` | #820 optimization: common rule global cho mọi user → fetch ngoài loop. Giảm N-1 DB calls khi batch 1000+ users. |
-| ② | **Check err** | Nếu DB fail khi fetch common rule | Common rule là bắt buộc cho mọi user — nếu lỗi, toàn batch phải stop, không user nào chạy được. |
-| ③ | **Return** | Trả err, notImplList rỗng | Retry handler sẽ thử lại. Không mark user cụ thể fail. |
-| ④ | **Cache** | Lưu `commonBaseBillingAmount` + `hasCommonBaseBilling` flag | Reuse cho toàn loop users phía sau, thay vì re-query. |
-| ⑤ | **For each user** | Iterate userList | Process từng user **trong transaction riêng** → 1 user fail không rollback user khác. |
-| ⑥ | **Return final** | Hết user, trả về retry + notImplList | End of batch. |
-| ⑦ | **Extract userID, creditLimit** | ParseInt string → int64 | Nếu creditLimit không parse được → mark notImpl ngay, không mở transaction. |
-| ⑧ | **Begin Tx** | Transaction boundary per user | **Atomicity**: mọi write (balance/history/billing) của 1 user phải commit-or-rollback cùng lúc, không được partial. |
-| ⑨ | **GetRepaymentBalance FOR UPDATE** | SELECT + lock row | Ngăn API user cập nhật cùng lúc → tránh race: batch cộng lãi trong khi user trả tiền → tổng sai. |
-| ⑩ | **Sum monthly_repayment_balances** | SUM WHERE date_of_use ≤ month (2 tháng trước) | Tính tổng outstanding principal (trên các giao dịch đã confirmed). Base để tính lãi và billing. |
-| ⑪ | **GetDirectDebit** | Fetch active auto-debit contract | Auto-debit user → nhánh xử lý riêng (b.0 trong 3.8, skip interest 3.12). |
-| ⑫ | **Status judge** | Fetch + evaluate hasDelay/hasLost/hasOD/hasEntrustment/hasSuspension | Business status lifecycle: 正常 → 遅延 → 期失 → 委託/停止. Mỗi status quyết định nhánh billing. |
-| ⑬ | **Billing calc** | 3.8 — quyết định `new_total_billing` | Core của issue #820. |
-| ⑭ | **Low-amount cancel** | Nếu dư < ¥1000 → release status | Cost-of-collection > debt value. |
-| ⑮ | **Interest calc** | Áp dụng rate tier, ghi `total_interests` + `interest_details` | Tính lãi 1 ngày. Audit trail từng ngày. |
-| ⑯ | **Update balance** | UPDATE `repayment_balances.total_repayment_balance` | Commit lãi hôm nay vào tổng nợ. |
-| ⑰ | **Commit Tx** | Release lock, flush writes | Atomic success per user. |
-
 ---
 
-## 4. Section 3.8 — Billing Judgment (nhánh #820 modify)
+## 4. Section 3.6 – 3.7 — Status gathering & judgment
 
 ```mermaid
 flowchart TD
-    S([3.8 Start]) --> UR[① <b>#820</b> Fetch user_min_repayment_rules<br/>📥 user_min_repayment_rules]
-    UR --> URE{② err?}
-    URE -- Yes --> RB1[③ Rollback + retry]
-    URE -- No --> Pri{④ User rule exists?}
-    Pri -- Yes --> UU[⑤ baseBillingAmount = user rule]
-    Pri -- No --> CC{⑥ Common rule cached?}
-    CC -- Yes --> UC[⑦ baseBillingAmount = common rule]
-    CC -- No --> ER[⑧ <b>#820</b> Error 900801000900204]
+    Start([After 3.5]) --> S361[3.6.1 GetRepaymentStatuses<br/>📥 repayment_statuses<br/>WHERE user_id=? AND status_id in 001/002/003/013/014]
+    S361 --> S362[3.6.2 GetRepaymentStatusNames<br/>📥 repayment_status_names<br/>master data]
+    S362 --> S363[3.6.3 Update item check<br/>collect bool flags]
+    S363 --> S364[3.6.4 Update / Insert repayment_status_controls<br/>📤 repayment_status_controls]
+    S364 --> S371[3.7.1 Re-fetch statuses<br/>📥 repayment_statuses]
+    S371 --> S372[3.7.2 GetMonthlyBillingAmount<br/>📥 monthly_billing_amounts<br/>WHERE user_id=? AND repaid_flg=0<br/>ORDER BY billing_month asc]
+    S372 --> S373[3.7.3 GetMonthlyOdBillingAmount<br/>📥 monthly_od_billing_amounts<br/>WHERE user_id=? AND repaid_flg=0]
+    S373 --> S374[3.7.4 Status transition<br/>compute hasDelay/hasLost/hasOverdraft<br/>sumNewBilling / sumRepaidBiling<br/>sumNewOdBilling / sumRepaidOdBiling]
+    S374 --> B1{hasEntrustment<br/>or hasSuspension?}
+    B1 -- Yes --> B1Path[B.1 期失解除<br/>B.2 遅延解除<br/>B.3 OD解除<br/>📤 repayment_statuses applied_flg=0<br/>📤 repayment_status_histories]
+    B1 -- No --> A1[3.7.4.A.1 Delay check<br/>A.2 Lost/Entrustment check<br/>A.3 Overdraft check<br/>📥 acceleration_notice_dates<br/>📤 repayment_statuses insert new<br/>📤 repayment_status_histories]
+    B1Path --> S375
+    A1 --> S375[3.7.5 Update control flags again<br/>📥 repayment_statuses<br/>📥 repayment_status_names<br/>📤 repayment_status_controls]
+    S375 --> S38([to 3.8])
+```
+
+---
+
+## 5. Section 3.8 — 請求額判定 (Billing Judgment) — Nhánh bị thay đổi #820
+
+```mermaid
+flowchart TD
+    Start([3.8 Start]) --> UserRule[<b>NEW #820</b> line 1849-1868<br/>GetUserMinRepaymentRule<br/>📥 user_min_repayment_rules<br/>WHERE user_id=? AND start_month<=currentMonth<br/>ORDER BY start_month DESC LIMIT 1]
+    UserRule --> UR_Err{err?}
+    UR_Err -- Yes --> Rollback1[Rollback + retry]
+    UR_Err -- No --> RulePri{User rule > 0?}
+    RulePri -- Yes --> UseUser[baseBillingAmount = userRule.MinRepaymentAmount<br/>📥 user_min_repayment_rules]
+    RulePri -- No --> ChkCommon{hasCommonBaseBilling?}
+    ChkCommon -- Yes --> UseCommon[baseBillingAmount = commonBaseBillingAmount<br/>📥 common_min_repayment_rules cache]
+    ChkCommon -- No --> Err204[<b>NEW #820</b><br/>err = Wrap1 900801000900204<br/>Rollback + retry]
     
-    UU --> SB{⑨ stop_billing_flg?}
-    UC --> SB
-    SB -- =1 --> BA[⑩ Nhánh a: set repaidFlg=1]
-    SB -- =0 --> OD[⑪ newODBillingAmount = total - creditLimit - OD diff]
+    UseUser --> StopChk{stop_billing_flg == 1?<br/>📥 repayment_status_controls}
+    UseCommon --> StopChk
+    StopChk -- Yes --> BranchA[3.8.B.2.A<br/>repaidFlg = 1<br/>repaidOdFlg = 1<br/>📤 monthly_billing_amounts PATCH<br/>📤 monthly_od_billing_amounts PATCH]
+    StopChk -- No --> CalcOD[newODBillingAmount =<br/>repayment_balances.total_repayment_balance<br/>- credit_limit users<br/>- sumNewOdBilling-sumRepaidOdBiling<br/>clamp >= 0]
     
-    OD --> AT{⑫ auto-debit?}
-    AT -- Yes --> B0[⑬ Nhánh b.0: OD=0, total=all outstanding]
-    AT -- No --> HL{⑭ hasLostStatus?}
-    HL -- Yes --> B1[⑮ Nhánh b.1: bill full outstanding]
-    HL -- No --> B2{⑯ diff >= baseBillingAmount?}
-    B2 -- Yes --> B21[⑰ <b>#820</b> b.2.1: newNormal = min base, diff]
-    B2 -- No --> B22[⑱ <b>#820</b> b.2.2 COMMENTED: giữ default 0]
+    CalcOD --> AccTxfer{accountTranferFlg == 1?<br/>📥 direct_debit_payment_terms}
+    AccTxfer -- Yes --> BranchB0[b.0 口座振替<br/>newODBilling = 0<br/>newTotalBilling = total-sumBill<br/>newNormalBilling = newTotalBilling]
+    AccTxfer -- No --> HasLost{hasLostStatus?<br/>📥 repayment_statuses id=003}
+    HasLost -- Yes --> BranchB1[b.1 期失<br/>newTotalBilling = total-sumBill<br/>newNormalBilling = newTotal - newOD]
+    HasLost -- No --> B2Cond{diff >= baseBillingAmount?<br/>diff = sumRepayment-sumRepaid<br/>- sumNewBilling-sumRepaidBiling<br/><b>#820: dynamic</b>}
+    B2Cond -- Yes --> B21[<b>b.2.1 — MODIFIED #820</b><br/>newNormalBilling = min baseBilling, diff<br/>newTotalBilling = newOD + newNormal]
+    B2Cond -- No --> B22[<b>b.2.2 — COMMENTED #820</b><br/>分岐不要<br/>giữ newTotalBilling = 0<br/>newNormalBilling = 0]
     
-    BA --> W[⑲ 3.8.B.3 Insert records<br/>📤 monthly_billing_amounts<br/>📤 monthly_od_billing_amounts<br/>📤 monthly_billing_histories]
-    B0 --> W
-    B1 --> W
-    B21 --> W
-    B22 --> W
+    BranchA --> Step383
+    BranchB0 --> Step383
+    BranchB1 --> Step383
+    B21 --> Step383
+    B22 --> Step383
+    Step383[3.8.B.3 Insert records<br/>📤 monthly_billing_amounts insert new row<br/>📤 monthly_od_billing_amounts insert new row<br/>📤 monthly_billing_histories insert billing/base_amount/total_repayment_balance]
+    Step383 --> Out([to 3.9])
 ```
-
-### Giải thích từng bước
-
-| # | Step | Technical | Business logic |
-|---|---|---|---|
-| ① | **Fetch user rule** | Query per user `WHERE user_id=? AND start_month≤currentMonth` | User VIP hoặc user có thoả thuận đặc biệt → override common rule. |
-| ② | **Check err** | DB query error | User này không xử lý được → rollback, đánh retry. Không dùng giá trị mặc định (tránh billing sai). |
-| ③ | **Rollback** | ROLLBACK current user transaction | Đảm bảo không có partial write. |
-| ④ | **User rule exists?** | `len(userMinRepaymentRules) > 0` | Priority logic: user > common. |
-| ⑤ | **Use user rule** | `baseBillingAmount = userRule.MinRepaymentAmount` | Áp dụng thoả thuận cá nhân. |
-| ⑥ | **Common rule cached?** | Dùng flag từ bước CalcLoop ① | Fallback khi user không có rule riêng. |
-| ⑦ | **Use common rule** | `baseBillingAmount = commonBaseBillingAmount` | Policy mặc định cho mọi user. |
-| ⑧ | **Error no rule** | `errm.Wrap1 900801000900204` + rollback | **Safety guard**: không có rule nào → fail an toàn thay vì dùng giá trị sai. Ops phải INSERT rule rồi retry. |
-| ⑨ | **stop_billing_flg?** | `repayment_status_controls.stop_billing_flg == 1` | Admin tạm ngừng billing (dispute, bug, customer service request). |
-| ⑩ | **Nhánh a** | `repaidFlg=1, repaidOdFlg=1`, patch existing rows | User không thấy invoice mới — đánh dấu "đã trả" để loop sau không revisit. |
-| ⑪ | **Compute newODBilling** | `total_repayment_balance - creditLimit - (sumNewOD - sumRepaidOD)`, clamp ≥ 0 | OD = số tiền user vượt credit limit. Dương → cần bill; âm → dưới limit, OD = 0. |
-| ⑫ | **auto-debit?** | `accountTranferFlg == 1` | User đã đăng ký kéo tiền tự động. |
-| ⑬ | **Nhánh b.0** | OD=0, bill toàn bộ outstanding | Auto-debit kéo toàn bộ — không cần chia OD/normal, không cần notification billing. |
-| ⑭ | **hasLostStatus?** | Có row `repayment_statuses.repayment_status_id = '003'` | User đã 期失 (vỡ nợ, quá hạn 3 tháng + notice sent). |
-| ⑮ | **Nhánh b.1** | `newTotalBilling = total - sumBill`, newNormal = total - OD | Đã vỡ nợ → đòi toàn bộ, không có khái niệm "trả tối thiểu" nữa. |
-| ⑯ | **diff >= baseBilling?** | diff = outstanding principal - unpaid billing | Nếu dư nợ còn đủ lớn để đòi ít nhất 1 kỳ minimum → vào b.2.1. |
-| ⑰ | **b.2.1 (modified #820)** | `newNormal = min(baseBilling, diff)` | **Normal case**: đòi min payment — nhưng không quá dư nợ (`min()` cap). `<br/>`Trước: hardcode 1000. Sau: dynamic từ `baseBillingAmount`. |
-| ⑱ | **b.2.2 (commented #820)** | Không vào nhánh nào → giữ `newTotal=0, newNormal=0` | Spec đánh 分岐不要. Khi diff < baseBilling → scenario hiếm (user đã được cancel ở 3.9). Code cũ có gán `newTotal=newOD` — code mới giữ 0. |
-| ⑲ | **Insert records** | INSERT 3 tables | Persist kết quả tháng này. `monthly_billing_histories` giữ audit log cho legal. |
 
 ---
 
-## 5. Section 3.12 — Interest Calculation
+## 6. Section 3.9 — 少額ユーザ 請求取消
 
 ```mermaid
 flowchart TD
-    S([3.12 start]) --> G{① stopCalcInterestFlg=0<br/>AND accountTranferFlg=0?}
-    G -- No --> Skip([② Skip → 3.13])
-    G -- Yes --> GR[③ GetInterestRateInID 1,3<br/>📥 interest_rates]
-    GR --> RE{④ rates nil/err?}
-    RE -- Yes --> RB[⑤ Error + Rollback]
-    RE -- No --> D[⑥ diff = sumRepay - sumRepaid]
-    D --> R{⑦ Rate range?}
-    R -- diff ≤ lower --> Z[⑧ oneDayInterest = 0]
-    R -- lower < diff < upper --> T1[⑨ rate=id1 × diff-sumBill]
-    R -- diff ≥ upper --> T3[⑩ rate=id3 × diff-sumBill]
-    T1 --> IC{⑪ interest ≥ 1?}
-    T3 --> IC
-    Z --> End
-    IC -- No --> End
-    IC -- Yes --> GT[⑫ GetTotalInterests<br/>📥 total_interests]
-    GT --> EX{⑬ Exists?}
-    EX -- No --> PT[⑭ INSERT total_interests<br/>📤 total_interests]
-    EX -- Yes --> UT[⑮ UPDATE total_interests<br/>📤 total_interests]
-    PT --> PD[⑯ INSERT interest_details<br/>📤 interest_details]
-    UT --> PD
-    PD --> End([→ 3.13])
+    Start([3.9 start]) --> AccChk{accountTranferFlg == 0?}
+    AccChk -- No --> Skip([skip → 3.12])
+    AccChk -- Yes --> Cond1{hasDelay AND NOT hasOverdraft AND NOT hasLost?}
+    Cond1 -- Yes --> C1_Diff{sumRepayment - sumRepaid < 1000?<br/>📥 from 3.5 cache}
+    C1_Diff -- Yes --> Patch1[PatchRepaymentStatuses02<br/>遅延解除<br/>📤 repayment_statuses applied_flg=0]
+    C1_Diff -- No --> Cond2
+    Cond1 -- No --> Cond2
+    Patch1 --> Cond2{hasOverdraft AND NOT hasLost<br/>AND sumRepayment-sumRepaid<1000<br/>AND total_repayment_balance<1000?<br/>📥 repayment_balances}
+    Cond2 -- Yes --> Patch2[PatchRepaymentStatuses02<br/>オーバードラフト解除<br/>📤 repayment_statuses applied_flg=0<br/>📤 repayment_status_histories]
+    Cond2 -- No --> End([→ 3.12])
+    Patch2 --> End
 ```
-
-### Giải thích từng bước
-
-| # | Step | Technical | Business logic |
-|---|---|---|---|
-| ① | **Guard conditions** | `stopCalcInterestFlg=0 AND accountTranferFlg=0` | 2 scenario skip: (a) admin ngừng lãi (customer service); (b) auto-debit user (tính lãi ở pipeline khác). |
-| ② | **Skip** | Bypass interest calc | Không ghi `total_interests`, không tăng `total_repayment_balance` từ interest. |
-| ③ | **Fetch rates** | Query `interest_rates IN (1,3)` | Tier rate: id=1 (thấp, cho nợ nhỏ), id=3 (cao, cho nợ lớn — theo Japan Interest Rate Act). |
-| ④ | **Check err/nil** | Rate không có → không tính lãi được | Data integrity — rate là master data phải có. |
-| ⑤ | **Error + rollback** | Wrap `900801000900204` | Ops phải kiểm tra lại seed data. |
-| ⑥ | **Compute diff** | `sumRepayment - sumRepaid` = outstanding principal | Base để tính lãi. |
-| ⑦ | **Determine range** | So sánh với lower_limit, upper_limit | Tier-based rate. |
-| ⑧ | **Below lower → 0 interest** | Nợ quá nhỏ | Policy: dưới ngưỡng không tính lãi (vd ¥1000 rounding). |
-| ⑨ | **Tier 1 rate** | `interest = rate × (diff - sumBill) / scale` | Nợ trung bình → rate thấp. Lưu ý: trừ `sumBill` (đã bill rồi) để không tính lãi 2 lần. |
-| ⑩ | **Tier 3 rate** | `interest = rate3 × (diff - sumBill)` | Nợ cao → rate cao (Japan regulation). |
-| ⑪ | **interest ≥ 1?** | Interest tính ra < 1 yen → skip | Rounding: không ghi row cho khoản lãi ≤ 0. |
-| ⑫ | **Fetch total_interests** | Check user đã có row chưa | Quyết định INSERT vs UPDATE. |
-| ⑬ | **Exists?** | `len(totalInterests) == 0` | Lần đầu tháng này hay không. |
-| ⑭ | **INSERT total_interests** | Row mới với `total_interest = oneDayInterest` | Start accumulate tháng mới. |
-| ⑮ | **UPDATE total_interests** | `total_interest += oneDayInterest` | Cộng dồn lãi các ngày trong tháng. |
-| ⑯ | **INSERT interest_details** | Row mỗi ngày: base, rate, interest | **Legal audit**: khi user dispute lãi, cần show từng ngày tính bao nhiêu. |
 
 ---
 
-## 6. Section 3.13 — Update repayment_balances
+## 7. Section 3.12 — 利息計算 (Interest Calc)
 
 ```mermaid
 flowchart TD
-    S([3.13 start]) --> P[① preInterestTarget =<br/>repayment_balance - sumRepay-sumRepaid]
-    P --> C{② oneDayInterest ≤ 0?}
-    C -- Yes --> Z[③ oneDayInterest = 0]
-    C -- No --> T
-    Z --> T[④ totalRepay =<br/>currentTotal + interest + delayInterest]
-    T --> U[⑤ UpdateRepaymentBalance<br/>📤 repayment_balances]
-    U --> E{⑥ err?}
-    E -- Yes --> RB[⑦ Rollback]
-    E -- No --> CM[⑧ Commit]
-    CM --> Next([→ next user])
+    Start([3.12 entry]) --> G1{stopCalcInterestFlg == 0<br/>AND accountTranferFlg == 0?<br/>📥 repayment_status_controls}
+    G1 -- No --> Skip([skip → 3.13])
+    G1 -- Yes --> GetRates[GetInterestRateInID ids=1,3<br/>📥 interest_rates<br/>WHERE interest_rate_id IN 1,3]
+    GetRates --> RatesErr{rates == nil OR err?}
+    RatesErr -- Yes --> Rollback[Wrap 900801000900204<br/>Rollback + retry]
+    RatesErr -- No --> Diff[diff = sumRepayment - sumRepaid<br/>📥 from 3.5 cache]
+    
+    Diff --> Range{Rate range?<br/>📥 interest_rates.lower_limit, upper_limit}
+    Range -- lower < diff < upper --> Calc1[rate = interestRateId1.interest_rate<br/>oneDayInterest = rate × diff-sumBill]
+    Range -- diff <= lower --> Zero[oneDayInterest = 0]
+    Range -- diff >= upper --> Calc3[rate = interestRateId3.interest_rate<br/>oneDayInterest = rate × diff-sumBill]
+    
+    Calc1 --> IntChk{oneDayInterest >= 1?}
+    Calc3 --> IntChk
+    Zero --> End
+    IntChk -- Yes --> GetTotal[GetTotalInterests<br/>📥 total_interests<br/>WHERE user_id=?]
+    GetTotal --> Exists{len totalInterests == 0?}
+    Exists -- Yes --> PutTotal[3.12.4.1 PutTotalInterest<br/>📤 total_interests INSERT]
+    Exists -- No --> UpdTotal[3.12.5 UpdateTotalInterest<br/>📤 total_interests UPDATE<br/>total_interest = old + oneDayInterest]
+    PutTotal --> PutDetail[PutInterestDetails<br/>📤 interest_details INSERT<br/>day, base_amount, interest_rate, interest]
+    UpdTotal --> PutDetail
+    PutDetail --> IntChk2{err?}
+    IntChk2 -- Yes --> Rollback
+    IntChk2 -- No --> End
+    IntChk -- No --> End([→ 3.13])
 ```
-
-### Giải thích từng bước
-
-| # | Step | Technical | Business logic |
-|---|---|---|---|
-| ① | **preInterestTarget** | `repayment_balance - (sumRepay - sumRepaid)` | Snapshot principal đang chịu lãi trước khi cộng interest hôm nay. Dùng cho delta tracking. |
-| ② | **Check interest ≤ 0** | Guard âm | Lỡ tính ra âm (decimal edge case) → treat as 0. |
-| ③ | **Clamp to 0** | `oneDayInterest = 0` | Không bao giờ trừ `total_repayment_balance`. |
-| ④ | **Compute new total** | `current + interest + delayInterest` | Tổng nợ mới = nợ cũ + lãi thường + lãi phạt trễ. |
-| ⑤ | **UPDATE balance** | `UPDATE repayment_balances SET total, interest_target, pre_interest_target` | Source of truth — frontend app sẽ đọc bảng này để show số nợ user. |
-| ⑥ | **Check err** | UPDATE fail (vd connection) | Phải rollback toàn bộ transaction (3.5-3.13). |
-| ⑦ | **Rollback** | Hủy mọi write của user | `total_interests` cũng bị rollback → không double charge khi retry. |
-| ⑧ | **Commit** | Release lock row `FOR UPDATE` từ 3.4 | Atomic finish. Các API user-facing đọc thấy giá trị mới. |
 
 ---
 
-## 7. Error handling pattern
+## 8. Section 3.13 — Update `repayment_balances`
 
 ```mermaid
 flowchart TD
-    S[① Step fail trong Tx] --> SE[② SetUserID ctx]
-    SE --> RB[③ Rollback]
-    RB --> RE{④ rollbackErr?}
-    RE -- Yes --> F[⑤ FatalErrHundling<br/>return false, list, err]
-    RE -- No --> W[⑥ Log warn LW0100000102]
-    W --> C[⑦ ContinueErrHundling<br/>append notImpl<br/>retry=true<br/>continue loop]
+    Start([3.13 entry]) --> Calc[preInterestTarget =<br/>repayment_balances.repayment_balance<br/>- sumRepayment - sumRepaid<br/>📥 repayment_balances + from 3.5]
+    Calc --> Clamp{oneDayInterest <= 0?}
+    Clamp -- Yes --> ZeroInt[oneDayInterest = 0]
+    Clamp -- No --> Total
+    ZeroInt --> Total[totalRepaymentBalance =<br/>current total_repayment_balance<br/>+ oneDayInterest<br/>+ oneDayDelayInterest]
+    Total --> Update[UpdateRepaymentBalance<br/>📤 repayment_balances<br/>total_repayment_balance<br/>interest_target = sumRepayment-sumRepaid<br/>pre_interest_target]
+    Update --> Err{err?}
+    Err -- Yes --> Rollback[Rollback + retry continue]
+    Err -- No --> Commit[Commit Transaction]
+    Commit --> Loop([→ next user])
 ```
-
-### Giải thích từng bước
-
-| # | Step | Technical | Business logic |
-|---|---|---|---|
-| ① | **Step fail** | Bất kỳ DB call / logic error | Không crash batch — đưa user này vào danh sách skip. |
-| ② | **SetUserID ctx** | Gán userID vào context cho log | Log có userID → Ops biết user nào fail. |
-| ③ | **Rollback** | Hủy transaction | Không để partial write làm sai data. |
-| ④ | **Check rollbackErr** | Rollback cũng fail → DB connection chết | Nặng hơn — không tiếp tục được. |
-| ⑤ | **Fatal handling** | Return ngay, không process user còn lại | Toàn bộ batch fail → handler retry. |
-| ⑥ | **Log warn** | `LW0100000102` code | Standard warning format — dashboard CloudWatch. |
-| ⑦ | **Continue handling** | Append user vào `notImplementedUsersList`, set retry=true, continue loop | User khác vẫn chạy. User fail này sẽ retry ngày mai (hoặc trong 3 lần retry của handler). |
 
 ---
 
-## 8. Đồ thị tổng (business view)
+## 9. Error handling pattern (chung cho mọi step)
+
+```mermaid
+flowchart TD
+    Step[Step X: DB call / business logic] --> ChkErr{err != nil?}
+    ChkErr -- No --> Next([next step])
+    ChkErr -- Yes --> SetUser[ctx = SetUserID ctx, userID]
+    SetUser --> RB[Rollback transaction]
+    RB --> RBErr{rollbackErr?}
+    RBErr -- Yes --> Fatal[FatalErrHundling<br/>return false, list, err]
+    RBErr -- No --> Warn[apllog.Warnf LW0100000102]
+    Warn --> Continue[ContinueErrHundling<br/>append to notImplementedUsersList<br/>retry = true<br/>continue loop]
+```
+
+---
+
+## 10. Retry strategy
+
+```mermaid
+flowchart LR
+    H[Handler.Run<br/>for cnt=0; cnt<3; cnt++] --> CI[CalcInterest]
+    CI --> R{retry == true<br/>err != nil?}
+    R -- retry=true --> Sleep[500ms]
+    Sleep --> H
+    R -- retry=false, err=nil --> Exit0[retValue = 0<br/>break]
+    R -- retry=false, err!=nil --> Exit1[retValue = 1<br/>break]
+```
+
+---
+
+## 11. Tổng thể end-to-end (zoom out)
 
 ```mermaid
 flowchart TB
-    subgraph Input
-        S3In[S3 UserList]
+    subgraph Handler
+        H1[Handler.Run] --> H2[Connect DB] --> H3[Build deps] --> H4[Retry loop x3]
     end
-    
-    subgraph Batch[Nightly batch interactor]
-        B1[① Fetch common rule #820]
-        B2[② Per user Tx]
-        B3[③ Lock balance]
-        B4[④ Compute outstanding]
-        B5[⑤ Judge status delay/lost/OD]
-        B6[⑥ Compute billing<br/>#820 min base, diff]
-        B7[⑦ Cancel small debt]
-        B8[⑧ Accrue interest]
-        B9[⑨ Update total]
-        B10[⑩ Commit]
+    subgraph Interactor
+        I1[CalcInterest] --> I2[Load user list<br/>📥 S3]
+        I2 --> I3[CalcLoop]
     end
-    
-    subgraph Output
-        DB[DB state updated]
-        S3Out[S3 NotImplList]
-        AppLog[CloudWatch logs]
+    subgraph CalcLoop
+        direction TB
+        L0[<b>#820</b> GetCommonMinRepaymentRule<br/>📥 common_min_repayment_rules] --> L1[for user in userList]
+        L1 --> L2[Begin Tx]
+        L2 --> L3[3.4-3.5<br/>📥 repayment_balances<br/>📥 monthly_repayment_balances<br/>📥 direct_debit_payment_terms]
+        L3 --> L4[3.6 status gather<br/>📥 repayment_statuses<br/>📥 repayment_status_names<br/>📤 repayment_status_controls]
+        L4 --> L5[3.7 status judge<br/>📥 monthly_billing_amounts<br/>📥 monthly_od_billing_amounts<br/>📥 acceleration_notice_dates<br/>📤 repayment_statuses<br/>📤 repayment_status_histories]
+        L5 --> L6[3.8 billing calc<br/>📥 <b>#820</b> user_min_repayment_rules<br/>📤 monthly_billing_amounts<br/>📤 monthly_od_billing_amounts<br/>📤 monthly_billing_histories]
+        L6 --> L7[3.9 low-amount cancel<br/>📤 repayment_statuses<br/>📤 repayment_status_histories]
+        L7 --> L8[3.12 interest calc<br/>📥 interest_rates<br/>📥 total_interests<br/>📤 total_interests<br/>📤 interest_details]
+        L8 --> L9[3.13 update balance<br/>📤 repayment_balances]
+        L9 --> L10[Commit]
+        L10 --> L1
     end
-    
-    S3In --> B1
-    B1 --> B2
-    B2 --> B3 --> B4 --> B5 --> B6 --> B7 --> B8 --> B9 --> B10
-    B10 --> DB
-    B2 -.fail.-> S3Out
-    B2 -.log.-> AppLog
+    H4 --> I1
+    I3 --> CalcLoop
+    L1 -. done .-> Final[notImplementedUsersList → S3 📤]
+    Final --> End([return])
 ```
 
-### Tóm tắt business outcomes
+---
 
-| Output | Ý nghĩa |
-|---|---|
-| `repayment_balances` updated | User thấy số nợ mới (+interest) trong app |
-| `monthly_billing_amounts` inserted | Billing tháng mới được sinh — hiển thị trên statement |
-| `total_interests` / `interest_details` | Audit trail lãi từng ngày — đáp ứng legal/dispute |
-| `repayment_status_histories` | Lịch sử status — legal compliance |
-| S3 NotImplList | Ops list — retry thủ công hoặc investigate |
-| CloudWatch warn LW0100000102 | Monitoring alert nếu số warn vượt threshold |
+## 12. Điểm thay đổi của Issue #820 (highlighted)
+
+| Nơi | Trước | Sau | Table mới |
+|---|---|---|---|
+| Đầu `CalcLoop` (line 304-318) | — | Fetch **1 lần** / batch | 📥 `common_min_repayment_rules` |
+| Trong for-user (line 1849-1899) | Hard-code `1000` | Priority user > common > error | 📥 `user_min_repayment_rules` |
+| `b.2.1` (line 2018-2037) | `newNormalBilling = 1000` | `min(baseBillingAmount, diff)` | — |
+| `b.2.2` (line 2039-2050) | `newTotalBilling = newOD`<br/>`newNormalBilling = 0` | **Comment out** (分岐不要) — giữ default 0 | — |
+
+```mermaid
+flowchart LR
+    subgraph Before[Code cũ]
+        BA[hard-code 1000]
+        BB[b.2.1: newNormal = 1000]
+        BC[b.2.2: newTotal = newOD<br/>when diff < 1000]
+    end
+    subgraph After[Code mới #820]
+        AA[common rule fetch 1 lần<br/>📥 common_min_repayment_rules]
+        AB[user rule fetch per user<br/>📥 user_min_repayment_rules<br/>priority user > common > ERROR]
+        AC[b.2.1: min baseBilling, diff]
+        AD[b.2.2: COMMENTED]
+    end
+    Before -. #820 .-> After
+```
+
+---
+
+## 13. Reference: Full table usage matrix
+
+| Table | Read (📥) | Write (📤) | Section |
+|---|---|---|---|
+| `users` | user_id, credit_limit (từ S3 / hardcode) | — | 3.3 |
+| `repayment_balances` | repayment_balance, total_repayment_balance, interest_target, pre_interest_target | total_repayment_balance, interest_target, pre_interest_target | 3.4, 3.13 |
+| `monthly_repayment_balances` | SUM(repayment_balance), SUM(repayed_balance) WHERE date_of_use≤month AND repayed_flg=0 | — | 3.5 |
+| `direct_debit_payment_terms` | status=2, apply_start≤today, apply_end>today | — | 3.5-2 |
+| `repayment_statuses` | repayment_status_id, applied_flg | applied_flg=0 (cancel), insert new status | 3.6.1, 3.7.1, 3.7.4.A.\*, 3.7.5.1, 3.9.1, 3.9.2 |
+| `repayment_status_names` | master data | — | 3.6.2, 3.7.5.2 |
+| `repayment_status_controls` | stop_billing_flg, stop_calc_interest_flg, stop_calc_late_charge_flg | các stop_* flags | 3.6.4, 3.7.5.4, 3.8.B.1 |
+| `repayment_status_histories` | — | history log khi thay đổi status | 3.7.4.\*, 3.9 |
+| `monthly_billing_amounts` | WHERE user_id AND repaid_flg=0, new_total_billing, repaid_billing, billing_month | INSERT new row (new_total_billing, new_normal_billing); PATCH repaid_flg | 3.7.2, 3.8.B.2/3 |
+| `monthly_od_billing_amounts` | WHERE user_id AND repaid_flg=0, new_od_billing, repaid_od_billing | INSERT new row; PATCH repaid_flg | 3.7.3, 3.8.B.2/3 |
+| `monthly_billing_histories` | — | INSERT: billing, repaid_amount, base_amount, total_repayment_balance, billing_month | 3.8.B.3 |
+| `acceleration_notice_dates` | acceleration_month → check 期失通知 | — | 3.7.4.A.2.1.2 |
+| `interest_rates` | id=1, id=3 → upper_limit, lower_limit, interest_rate | — | 3.12 |
+| `total_interests` | total_interest (check tồn tại) | INSERT / UPDATE total_interest | 3.12.4, 3.12.5 |
+| `interest_details` | — | INSERT: day, base_amount, interest_rate, interest | 3.12.4.1 |
+| `total_late_charges` | — | (used in late-charge path, not core to #820) | 3.10 |
+| `late_charge_detail` | — | (used in late-charge path) | 3.10 |
+| `unapplied_repayments` | — | (used in repay-apply path) | 3.11 |
+| **`common_min_repayment_rules`** 🆕 | start_month ≤ currentMonth, min_repayment_amount, ORDER start_month DESC LIMIT 1 | — | #820 — line 304-318 |
+| **`user_min_repayment_rules`** 🆕 | WHERE user_id AND start_month ≤ currentMonth, min_repayment_amount | — | #820 — line 1849-1868 |
+| S3 bucket | UserList.FileName (user list input) | NotImplementedUsersList output | Entry / End |
+
+---
+
+# Version 2 — Flow + Business Logic
+
+Phần này bổ sung **WHY** (nghiệp vụ đằng sau) cho từng step. Version 1 ở trên trả lời **WHAT/HOW** (kỹ thuật).
+
+## V2.1 — Bối cảnh nghiệp vụ tổng quan
+
+Batch `bt-intcalc` là **金利計算バッチ** (Interest Calculation Batch), chạy **mỗi ngày** để:
+
+1. **Tính lãi hàng ngày** cho từng khoản vay (sumRepaymentBalance × interest_rate).
+2. **Sinh request billing** hàng tháng cho user (số tiền tối thiểu phải trả).
+3. **Cập nhật trạng thái nợ**: phát hiện trễ hạn (delay), vỡ nợ (lost/期失), vượt hạn mức (overdraft).
+4. **Xử lý miễn trừ**: user đăng ký 口座振替 (auto-debit), user nợ nhỏ (< ¥1000) được cancel billing.
+
+**Stakeholder & constraint:**
+- Legal/Compliance: phải log đầy đủ lịch sử thay đổi status (`repayment_status_histories`).
+- Ops: nếu 1 user fail, **không** được block toàn batch — chỉ mark user đó vào `notImplementedUsersList` để retry thủ công.
+- Performance: có thể chạy với **1000+ users/đêm** → tối ưu query (#820 split common rule fetch).
+
+```mermaid
+flowchart LR
+    subgraph Daily[Mỗi ngày 深夜バッチ]
+        D1[Tính lãi 1 ngày<br/>per user]
+        D2[Update tổng nợ<br/>repayment_balances]
+    end
+    subgraph Monthly[Đầu tháng]
+        M1[Sinh billing amount<br/>= min baseRule, outstanding]
+        M2[User thanh toán qua<br/>口座振替 / 手動]
+    end
+    subgraph Exception[Khi có bất thường]
+        E1[Phát hiện trễ hạn<br/>→ status 002 遅延]
+        E2[Vượt hạn mức<br/>→ status 001 OD]
+        E3[Vỡ nợ → 003 期失<br/>acceleration notice]
+    end
+    Daily --> Monthly
+    Daily --> Exception
+```
+
+---
+
+## V2.2 — Business logic cho từng section
+
+### 3.4 — GetRepaymentBalance (với `FOR UPDATE`)
+
+```mermaid
+flowchart LR
+    A[GetRepaymentBalance FOR UPDATE] --> B[Lock row của user<br/>trong transaction]
+    B --> C[Đảm bảo không có<br/>batch/API khác ghi song song]
+```
+
+**Business reason:**
+- `repayment_balances` là **source of truth** cho tổng dư nợ.
+- Nếu API user-facing cập nhật cùng lúc → race condition → tính lãi sai.
+- `SELECT FOR UPDATE` lock row cho đến Commit/Rollback → atomic per-user.
+
+---
+
+### 3.5 — SUM monthly_repayment_balances với `date_of_use <= month-2`
+
+**Business reason:**
+- `month` truyền vào = `time.Now().Month() - 2` (2 tháng trước) — KHÔNG phải tháng hiện tại.
+- Nghiệp vụ: **利息は利用確定後に課す** (lãi chỉ tính sau khi giao dịch đã confirmed). Thẻ tín dụng có 請求確定期間 khoảng 2 tháng → chỉ tính lãi trên phần **đã confirmed**.
+- Do đó `date_of_use <= '202602'` (khi chạy 2026-04) nghĩa là: "tính lãi trên các giao dịch đã confirmed đến hết tháng 2".
+
+```mermaid
+flowchart LR
+    T1[TX tháng 4] -.chưa confirm.-> NoInterest[KHÔNG tính lãi]
+    T2[TX tháng 3] -.đang confirm.-> NoInterest
+    T3[TX tháng 2 hoặc trước] --confirmed--> Interest[TÍNH LÃI]
+```
+
+---
+
+### 3.5-2 — direct_debit_payment_terms → `accountTranferFlg`
+
+**Business reason:**
+- User đăng ký 口座振替 (auto-debit từ tài khoản ngân hàng) được đối xử **khác** trong mọi bước downstream:
+  - **3.8**: không sinh OD billing (tiền sẽ bị debit tự động, không cần notify)
+  - **3.9**: cho phép cancel billing nhỏ (vì auto-debit sẽ tự refund qua clearing)
+  - **3.12**: **không** tính lãi bằng batch (đã tính riêng trong direct-debit flow)
+- Nếu user có thay đổi kế hoạch auto-debit, cột `status='2'` = active contract.
+
+---
+
+### 3.6 – 3.7 — Status judgment (delay / lost / overdraft)
+
+```mermaid
+flowchart TD
+    Check[Fetch repayment_statuses<br/>current flags] --> Compute[Compute:<br/>hasDelay, hasLost, hasOD]
+    Compute --> Branch{Condition satisfied?}
+    Branch -- Payment cleared --> B_Rel[Release status:<br/>applied_flg = 0<br/>📤 history log]
+    Branch -- Still overdue --> B_New[Insert new status:<br/>applied_flg = 1<br/>📤 history log]
+    
+    subgraph BusinessRules[Business rules]
+        R1[遅延 002: quá hạn 1 tháng]
+        R2[OD 001: vượt credit_limit]
+        R3[期失 003: quá hạn 3 tháng<br/>sau khi gửi 期失通知]
+        R4[委託 013: đưa sang đòi nợ]
+        R5[停止 014: ngừng cấp tín dụng]
+    end
+```
+
+**Business reason:**
+- Status **lifecycle**: 正常 → 遅延 (quá 1 tháng) → 期失 (quá 3 tháng + notice sent) → 委託/停止.
+- Mỗi lần chuyển status phải ghi `repayment_status_histories` (legal requirement: truy xuất lịch sử nợ).
+- Nếu user trả hết → tự động `applied_flg=0` (release status) thay vì DELETE → giữ lịch sử.
+
+---
+
+### 3.8 — Billing Judgment (phần được modify #820)
+
+```mermaid
+flowchart TD
+    Start[Start 3.8] --> BR[baseBillingAmount<br/>= min payment per month<br/>theo hợp đồng]
+    BR --> Business1[<b>Business rule</b>:<br/>Mỗi tháng user phải trả ít nhất<br/>baseBillingAmount]
+    Business1 --> Stop{stop_billing_flg?}
+    Stop -- Admin hold --> Skip[Không sinh billing<br/>Marking repaid để không tính thêm]
+    Stop -- Normal --> AccTxf{auto-debit?}
+    AccTxf -- Yes --> B0[Không OD billing<br/>toàn bộ auto-debit toàn outstanding]
+    AccTxf -- No --> Lost{期失?}
+    Lost -- Yes --> B1[Full outstanding<br/>đòi toàn bộ vì đã vỡ nợ]
+    Lost -- No --> B2[Normal case:<br/>Đòi min baseBilling, outstanding]
+    
+    B2 --> Before[<b>Trước #820:</b> hardcode 1000]
+    B2 --> After[<b>#820:</b> dynamic từ DB<br/>user-specific hoặc global]
+```
+
+**Business reason các nhánh:**
+
+| Nhánh | Scenario | Business logic |
+|---|---|---|
+| **a) stop_billing_flg=1** | Admin tạm dừng billing (vd: bug, dispute) | Không sinh request → user không thấy invoice mới. Đánh `repaid_flg=1` để loop sau không revisit. |
+| **b.0) account_transfer_flg=1** | User đã đăng ký 口座振替 | OD không cần vì auto-debit sẽ kéo tiền về. `newTotalBilling = total outstanding` (debit full amount). |
+| **b.1) hasLostStatus** | User đã 期失 (vỡ nợ, quá 3 tháng) | Đòi toàn bộ dư nợ còn lại — không có khái niệm "trả tối thiểu" nữa. |
+| **b.2) Normal case** | User thường, chưa vỡ nợ, không auto-debit | Đòi `min(baseBillingAmount, diff)` — đảm bảo user trả tối thiểu nhưng không quá dư nợ. |
+
+**Tại sao #820 phải dynamic baseBillingAmount?**
+
+```mermaid
+flowchart LR
+    Before[Trước: hardcode 1000] --> Problem1[Không config được<br/>theo user hoặc theo thời gian]
+    Problem1 --> Problem2[Muốn tăng/giảm<br/>phải deploy code]
+    Before --> Before2[Ảnh hưởng tới chính sách:<br/>VD regulation thay đổi<br/>base amount]
+    After[Sau: DB config] --> Benefit1[Thay giá trị không cần deploy]
+    After --> Benefit2[User VIP có thể override<br/>user_min_repayment_rules]
+    After --> Benefit3[Dùng start_month<br/>để schedule thay đổi trước]
+```
+
+**Tại sao b.2.2 bị comment (分岐不要)?**
+
+- b.2.2 cũ: khi `diff < 1000` → `newTotalBilling = newODBilling`, `newNormalBilling = 0`.
+- Nghiệp vụ sau review: scenario này **hiếm xảy ra** với logic upstream (nếu diff < 1000, thường đã được cancel ở 3.9). Giữ default `0` thay vì chạy nhánh riêng → đơn giản hoá.
+- ⚠ Vẫn cần PM confirm: nếu có user OD nhưng diff < baseBilling, code mới sẽ **không** bill OD phần đó nữa.
+
+---
+
+### 3.9 — Low-amount billing cancel (<¥1000)
+
+**Business reason:**
+- Khi dư nợ < ¥1000 và user ở trạng thái 遅延/OD, batch tự động release status.
+- Lý do: chi phí đòi ¥1000 > giá trị nợ. Rounding policy.
+- CHỈ áp dụng cho **auto-debit user** (`accountTranferFlg=0` ngược nghĩa — xem lại code: actually condition là `accountTranferFlg == 0` tức **không auto-debit**).
+
+---
+
+### 3.12 — Interest Calculation
+
+```mermaid
+flowchart TD
+    Diff[diff = sumRepayment - sumRepaid<br/>= outstanding principal] --> Range{diff vs limits?}
+    Range -- diff <= 下限 --> NoInt[oneDayInterest = 0<br/>nợ quá nhỏ không tính lãi]
+    Range -- 下限 < diff < 上限 --> Tier1[Rate 1 áp dụng<br/>vd 15% APR]
+    Range -- diff >= 上限 --> Tier3[Rate 3 áp dụng<br/>vd 18% APR - high tier]
+    
+    Tier1 --> Formula[oneDayInterest =<br/>rate × outstanding × 1/365]
+    Tier3 --> Formula
+    
+    Formula --> Accum{total_interests exists?}
+    Accum -- No --> Insert[INSERT new row<br/>lần đầu trong tháng]
+    Accum -- Yes --> Update[UPDATE:<br/>total += today's interest]
+    
+    Insert --> Detail[INSERT interest_details<br/>ghi lại lãi mỗi ngày<br/>cho audit/legal]
+    Update --> Detail
+```
+
+**Business reason:**
+- **Tiered rate**: Japan Interest Rate Act — nợ lớn có lãi suất cao hơn theo tầng. `interest_rates` table config 2 tier (id=1 thấp, id=3 cao).
+- **Per-day calc**: `rate × diff / 365` (lãi đơn ngày) → cộng dồn vào `total_interests` hàng tháng. Cuối tháng, total_interest sẽ thành 1 billing entry cho tháng sau.
+- **`interest_details` audit log**: mỗi ngày 1 row với base_amount + rate + interest → required for dispute handling.
+- **Guard điều kiện `stopCalcInterestFlg=0 && accountTranferFlg=0`**: admin có thể ngừng lãi (customer service), auto-debit user đã tính lãi ở pipeline khác.
+
+---
+
+### 3.13 — Update repayment_balances
+
+**Business reason:**
+- Sau khi cộng lãi ngày hôm nay, `total_repayment_balance` = tổng nợ mới (principal + interest + late_charge).
+- `interest_target` = principal chưa trả (base để tính lãi ngày mai).
+- `pre_interest_target` = snapshot của interest_target trước khi update (for delta calc).
+
+---
+
+## V2.3 — Transaction boundary & data consistency
+
+```mermaid
+flowchart TD
+    Begin[BEGIN TRANSACTION per user] --> L1[SELECT repayment_balances FOR UPDATE<br/>🔒 LOCK user row]
+    L1 --> Calc[...3.5 → 3.13...]
+    Calc --> Result{Any error?}
+    Result -- Yes --> Rollback[ROLLBACK<br/>→ user data giữ nguyên<br/>→ marked notImpl để retry]
+    Result -- No --> Commit[COMMIT<br/>→ atomic update mọi table]
+    
+    subgraph Consistency[Tại sao atomic quan trọng?]
+        C1[Ghi total_interests<br/>+ interest_details<br/>+ repayment_balances<br/>+ monthly_billing_*]
+        C2[Nếu commit partial<br/>sẽ sai tổng số]
+    end
+```
+
+**Business reason:**
+- **Atomicity requirement (legal)**: `total_interests` ghi "đã tính lãi" nhưng `repayment_balances.total_repayment_balance` chưa cộng → user bị charge 2 lần khi batch chạy lại.
+- **Row-level lock vs table-level**: dùng `FOR UPDATE` trên `repayment_balances` cho từng user → các user khác vẫn chạy parallel.
+- **Retry tại user granularity**: 1 user fail không block N-1 users khác.
+
+---
+
+## V2.4 — Ảnh hưởng #820 lên business logic
+
+```mermaid
+flowchart TB
+    subgraph OldBehavior[Trước #820]
+        O1[1000 yen<br/>hardcode cho mọi user]
+        O2[Không phân biệt<br/>regular vs VIP]
+        O3[Thay đổi phải<br/>deploy code]
+    end
+    
+    subgraph NewBehavior[Sau #820]
+        N1[Giá trị config<br/>ở DB]
+        N2[User rule override<br/>common rule]
+        N3[Thay đổi qua<br/>INSERT/UPDATE SQL]
+        N4[Schedule thay đổi<br/>bằng start_month tương lai]
+    end
+    
+    subgraph BusinessValue[Business value]
+        B1[Regulation compliance:<br/>Nhanh chóng điều chỉnh<br/>khi luật đổi]
+        B2[Customer segmentation:<br/>VIP trả min thấp hơn]
+        B3[A/B test:<br/>Thử nghiệm mức base<br/>không cần release]
+        B4[Audit: <br/>start_month + pgm_id<br/>→ truy xuất ai/khi nào đổi]
+    end
+    
+    OldBehavior -. #820 .-> NewBehavior
+    NewBehavior --> BusinessValue
+```
+
+**Tác động tới test:**
+- **TC4 (no rule → error)**: đây là **safety guard** — nếu ops quên INSERT rule sau migration, batch fail an toàn thay vì dùng giá trị sai.
+- **TC6 (latest rule)**: support schedule — có thể insert rule cho `start_month` tương lai, sẽ tự active khi tới tháng đó.
+- **TC3 (rollback)**: đảm bảo không có partial write → user không bị sai data khi config thiếu.
+
+---
+
+## V2.5 — Failure modes & mitigation (business perspective)
+
+| Failure | Tác động business | Mitigation trong code |
+|---|---|---|
+| DB connection mất giữa chừng | User bị sai billing | Rollback toàn transaction, retry 3 lần (handler.go:94) |
+| `common_min_repayment_rules` bị xóa nhầm | Batch fail toàn bộ (blocking) | Error `900801000900204` + retry. Ops phải restore rule. |
+| User rule mâu thuẫn common rule | User bị billing sai | Priority hierarchy: user > common (explicit logic tại b.2) |
+| Interest rate changed mid-batch | 1 phần user dùng rate cũ, 1 phần rate mới | Batch fetch `interest_rates` mỗi user (consistent trong tx) |
+| User có 期失 nhưng cũng OD | Confusion trong xử lý | Priority: Lost (b.1) > OD check → luôn bill full |
+| Duplicate batch run (same day) | Double billing / double interest | `total_interests` check existence → UPDATE thay vì INSERT. `monthly_billing_amounts` có unique (user_id, billing_month). |
+
